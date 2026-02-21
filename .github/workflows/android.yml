@@ -1,0 +1,181 @@
+name: Android Build zeroclaw.tar.xz (Latest Upstream Tag)
+
+on:
+  workflow_dispatch:
+    inputs:
+      sync_fork_main:
+        description: "Sync fork main <- upstream/main trước khi build"
+        required: false
+        default: true
+        type: boolean
+
+permissions:
+  contents: write
+
+concurrency:
+  group: android-build-latest-upstream-tag
+  cancel-in-progress: false
+
+jobs:
+  sync-upstream:
+    if: ${{ inputs.sync_fork_main == true }}
+    runs-on: ubuntu-latest
+    outputs:
+      latest_tag: ${{ steps.meta.outputs.latest_tag }}
+    steps:
+      - name: Checkout fork
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Sync fork main with upstream/main
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git remote add upstream https://github.com/zeroclaw-labs/zeroclaw.git 2>/dev/null || true
+          git fetch upstream --tags
+          git fetch upstream main
+
+          git checkout main
+          git reset --hard upstream/main
+          git push origin main --force-with-lease
+
+      - name: Detect latest upstream tag
+        id: meta
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch upstream --tags --force
+          LATEST_TAG="$(git tag -l 'v*' --sort=-v:refname | head -n1)"
+          if [ -z "$LATEST_TAG" ]; then
+            echo "No upstream tag matched v*" >&2
+            exit 1
+          fi
+          echo "latest_tag=$LATEST_TAG" >> "$GITHUB_OUTPUT"
+          echo "Latest upstream tag: $LATEST_TAG"
+
+  build-android-tarxz:
+    needs: [sync-upstream]
+    if: ${{ always() && (needs.sync-upstream.result == 'success' || needs.sync-upstream.result == 'skipped') }}
+    runs-on: [self-hosted, linux, arm64, termux]
+    env:
+      CARGO_TERM_COLOR: always
+
+    steps:
+      - name: Checkout fork
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Select latest upstream tag
+        id: meta
+        shell: bash
+        run: |
+          set -euo pipefail
+          git remote add upstream https://github.com/zeroclaw-labs/zeroclaw.git 2>/dev/null || true
+          git fetch upstream --tags --force
+
+          TAG_FROM_SYNC='${{ needs.sync-upstream.outputs.latest_tag }}'
+          if [ -n "$TAG_FROM_SYNC" ]; then
+            LATEST_TAG="$TAG_FROM_SYNC"
+          else
+            LATEST_TAG="$(git tag -l 'v*' --sort=-v:refname | head -n1)"
+          fi
+
+          if [ -z "$LATEST_TAG" ]; then
+            echo "No upstream tag matched v*" >&2
+            exit 1
+          fi
+
+          git checkout "tags/$LATEST_TAG"
+          echo "latest_tag=$LATEST_TAG" >> "$GITHUB_OUTPUT"
+          echo "Building tag: $LATEST_TAG"
+
+      - name: Install Termux dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          pkg update -y
+          pkg upgrade -y
+          pkg install -y rust git binutils clang pkg-config patchelf xz file
+
+      - name: Build release
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build --release --locked || {
+            pkg install -y openssl libandroid-glob || true
+            export OPENSSL_DIR="$PREFIX"
+            cargo build --release --locked
+          }
+
+      - name: Verify binary
+        shell: bash
+        run: |
+          set -euo pipefail
+          ls -lh target/release/zeroclaw
+          file target/release/zeroclaw
+          ./target/release/zeroclaw --version
+          readelf -d target/release/zeroclaw | grep -E 'NEEDED|RPATH|RUNPATH' || true
+
+      - name: Pack zeroclaw.tar.xz
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist/stage/bin dist/stage/lib/zeroclaw
+          install -m 0755 target/release/zeroclaw dist/stage/bin/zeroclaw
+
+          REPORT="dist/zeroclaw-portable-report.txt"
+          INFO="dist/build-info.txt"
+
+          {
+            echo "tag=${{ steps.meta.outputs.latest_tag }}"
+            echo "commit=$(git rev-parse --short HEAD)"
+            echo "date=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          } > "$INFO"
+
+          {
+            echo "## BEFORE PATCH (readelf -d bin/zeroclaw)"
+            readelf -d dist/stage/bin/zeroclaw | grep -E 'NEEDED|RPATH|RUNPATH' || true
+            echo
+            echo "## PATCH"
+          } > "$REPORT"
+
+          patchelf --set-rpath '$ORIGIN/../lib:$ORIGIN/../lib/zeroclaw' dist/stage/bin/zeroclaw
+          echo "patched bin/zeroclaw" >> "$REPORT"
+
+          {
+            echo
+            echo "## AFTER PATCH (readelf -d bin/zeroclaw)"
+            readelf -d dist/stage/bin/zeroclaw | grep -E 'NEEDED|RPATH|RUNPATH' || true
+            echo
+            echo "## VERIFY termux path in RPATH/RUNPATH"
+          } >> "$REPORT"
+
+          if readelf -d dist/stage/bin/zeroclaw | grep -E 'RPATH|RUNPATH' | grep -q 'com.termux'; then
+            echo "FAIL: termux path still exists" >> "$REPORT"
+            exit 1
+          else
+            echo "PASS: no termux path in RPATH/RUNPATH" >> "$REPORT"
+          fi
+
+          {
+            echo
+            echo "## SMOKE TEST from staged runtime"
+            LD_LIBRARY_PATH="dist/stage/lib:dist/stage/lib/zeroclaw" dist/stage/bin/zeroclaw --version
+          } >> "$REPORT"
+
+          tar -C dist/stage -cJf dist/zeroclaw.tar.xz .
+          xz -lv dist/zeroclaw.tar.xz
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: zeroclaw-android-${{ steps.meta.outputs.latest_tag }}
+          path: |
+            dist/zeroclaw.tar.xz
+            dist/zeroclaw-portable-report.txt
+            dist/build-info.txt
