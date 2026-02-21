@@ -46,9 +46,11 @@ jobs:
   build-android-tarxz:
     needs: [sync-upstream]
     if: ${{ always() && (needs.sync-upstream.result == 'success' || needs.sync-upstream.result == 'skipped') }}
-    runs-on: [self-hosted, linux, arm64, termux]
+    runs-on: ubuntu-latest        # ← GitHub cloud, không cần điện thoại
     env:
       CARGO_TERM_COLOR: always
+      ANDROID_TARGET: aarch64-linux-android
+      ANDROID_API: "24"           # Android 7.0+, đủ cho hầu hết thiết bị
 
     steps:
       - name: Checkout fork
@@ -63,7 +65,8 @@ jobs:
           set -euo pipefail
           git remote add upstream https://github.com/zeroclaw-labs/zeroclaw.git 2>/dev/null || true
 
-          LATEST_TAG="$(git ls-remote --tags --refs upstream 'v*' | awk -F/ '{print $3}' | sort -V | tail -n1)"
+          LATEST_TAG="$(git ls-remote --tags --refs upstream 'v*' \
+            | awk -F/ '{print $3}' | sort -V | tail -n1)"
           if [ -z "$LATEST_TAG" ]; then
             echo "No upstream tag matched v*" >&2
             exit 1
@@ -75,39 +78,72 @@ jobs:
           echo "latest_tag=$LATEST_TAG" >> "$GITHUB_OUTPUT"
           echo "Building tag: $LATEST_TAG"
 
-      - name: Install Termux dependencies
+      - name: Install Rust + Android target
         shell: bash
         run: |
           set -euo pipefail
-          pkg update -y
-          pkg upgrade -y
-          pkg install -y rust git binutils clang pkg-config patchelf xz file
+          rustup update stable
+          # Thêm cross-compile target Android ARM64
+          rustup target add aarch64-linux-android
 
-      - name: Build release
+      - name: Setup Android NDK
+        id: ndk
+        uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: r27c      # NDK LTS, stable
+
+      - name: Configure cross-compile linker
         shell: bash
         run: |
           set -euo pipefail
-          cargo build --release --locked || {
-            pkg install -y openssl libandroid-glob || true
-            export OPENSSL_DIR="$PREFIX"
-            cargo build --release --locked
-          }
+          NDK_BIN="${{ steps.ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          LINKER="${NDK_BIN}/aarch64-linux-android${ANDROID_API}-clang"
+
+          echo "NDK_BIN=$NDK_BIN" >> "$GITHUB_ENV"
+
+          # Cấu hình cargo dùng NDK clang làm linker
+          mkdir -p .cargo
+          cat > .cargo/config.toml << EOF
+          [target.aarch64-linux-android]
+          linker = "${LINKER}"
+          ar     = "${NDK_BIN}/llvm-ar"
+          EOF
+
+          echo "Linker: $LINKER"
+
+      - name: Build release (cross-compile → Android ARM64)
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build --release --locked --target aarch64-linux-android
 
       - name: Verify binary
         shell: bash
         run: |
           set -euo pipefail
-          ls -lh target/release/zeroclaw
-          file target/release/zeroclaw
-          ./target/release/zeroclaw --version
-          readelf -d target/release/zeroclaw | grep -E 'NEEDED|RPATH|RUNPATH' || true
+          BIN="target/aarch64-linux-android/release/zeroclaw"
+
+          ls -lh "$BIN"
+          file "$BIN"
+
+          # Kiểm tra: phải là ARM aarch64, linker phải là /system/bin/linker64
+          file "$BIN" | grep -q 'ARM aarch64' || { echo "FAIL: not ARM aarch64"; exit 1; }
+          readelf -l "$BIN" | grep -q 'linker64'   || { echo "WARN: linker64 not found"; }
+
+          echo "NEEDED libs (expect Bionic only):"
+          readelf -d "$BIN" | grep NEEDED
+
+          echo "RUNPATH (expect none or Termux path to be removed):"
+          readelf -d "$BIN" | grep -E 'RPATH|RUNPATH' || echo "<none — correct>"
 
       - name: Pack zeroclaw.tar.xz
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p dist/stage/bin dist/stage/lib/zeroclaw
-          install -m 0755 target/release/zeroclaw dist/stage/bin/zeroclaw
+          BIN="target/aarch64-linux-android/release/zeroclaw"
+
+          mkdir -p dist/stage/bin
+          install -m 0755 "$BIN" dist/stage/bin/zeroclaw
 
           REPORT="dist/zeroclaw-portable-report.txt"
           INFO="dist/build-info.txt"
@@ -116,41 +152,49 @@ jobs:
             echo "tag=${{ steps.meta.outputs.latest_tag }}"
             echo "commit=$(git rev-parse --short HEAD)"
             echo "date=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo "target=aarch64-linux-android"
+            echo "android_api=${ANDROID_API}"
+            echo "ndk=r27c"
           } > "$INFO"
 
           {
-            echo "## BEFORE PATCH (readelf -d bin/zeroclaw)"
-            readelf -d dist/stage/bin/zeroclaw | grep -E 'NEEDED|RPATH|RUNPATH' || true
+            echo "## NEEDED libs"
+            readelf -d dist/stage/bin/zeroclaw | grep NEEDED
             echo
-            echo "## PATCH"
+            echo "## RUNPATH before patch"
+            readelf -d dist/stage/bin/zeroclaw | grep -E 'RPATH|RUNPATH' || echo "<none>"
           } > "$REPORT"
 
-          patchelf --set-rpath '$ORIGIN/../lib:$ORIGIN/../lib/zeroclaw' dist/stage/bin/zeroclaw
-          echo "patched bin/zeroclaw" >> "$REPORT"
+          # NDK build thường không embed Termux path
+          # Nhưng verify và patch nếu có
+          RUNPATH=$(readelf -d dist/stage/bin/zeroclaw \
+            | grep -E 'RPATH|RUNPATH' | awk -F'[][]' '{print $2}' || true)
 
-          {
-            echo
-            echo "## AFTER PATCH (readelf -d bin/zeroclaw)"
-            readelf -d dist/stage/bin/zeroclaw | grep -E 'NEEDED|RPATH|RUNPATH' || true
-            echo
-            echo "## VERIFY termux path in RPATH/RUNPATH"
-          } >> "$REPORT"
-
-          if readelf -d dist/stage/bin/zeroclaw | grep -E 'RPATH|RUNPATH' | grep -q 'com.termux'; then
-            echo "FAIL: termux path still exists" >> "$REPORT"
-            exit 1
+          if echo "$RUNPATH" | grep -q 'com.termux'; then
+            patchelf --remove-rpath dist/stage/bin/zeroclaw
+            echo "PATCHED: removed Termux RUNPATH" >> "$REPORT"
           else
-            echo "PASS: no termux path in RPATH/RUNPATH" >> "$REPORT"
+            echo "PASS: no Termux path" >> "$REPORT"
           fi
 
           {
             echo
-            echo "## SMOKE TEST from staged runtime"
-            LD_LIBRARY_PATH="dist/stage/lib:dist/stage/lib/zeroclaw" dist/stage/bin/zeroclaw --version
+            echo "## RUNPATH after patch"
+            readelf -d dist/stage/bin/zeroclaw | grep -E 'RPATH|RUNPATH' || echo "<none — correct>"
+            echo
+            echo "## arch check"
+            file dist/stage/bin/zeroclaw
           } >> "$REPORT"
+
+          # Smoke test: không thể chạy ARM64 trên ubuntu x86_64
+          # Chỉ verify arch
+          file dist/stage/bin/zeroclaw | grep -q 'ARM aarch64' \
+            && echo "PASS: ARM aarch64 confirmed" >> "$REPORT" \
+            || { echo "FAIL: unexpected arch"; exit 1; }
 
           tar -C dist/stage -cJf dist/zeroclaw.tar.xz .
           xz -lv dist/zeroclaw.tar.xz
+          cat "$REPORT"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
